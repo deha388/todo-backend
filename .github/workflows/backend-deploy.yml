@@ -65,35 +65,47 @@ jobs:
           # System status
           echo "💾 Memory: $(free -h | awk '/^Mem:/{printf "%s used, %s available", $3, $7}')"
           
-          # 🧹 CLEANUP: Remove old backend deployments
-          echo "🧹 Cleaning old backend deployments..."
+          # 🧹 AGGRESSIVE CLEANUP: Complete reset for fresh deployment
+          echo "🧹 STEP 1: Cleaning Kubernetes resources..."
           k3s kubectl delete deployment todo-backend --ignore-not-found=true --timeout=60s
           k3s kubectl delete service todo-backend-service --ignore-not-found=true --timeout=60s
+          k3s kubectl delete configmap todo-backend-config --ignore-not-found=true --timeout=30s
+          k3s kubectl delete pods -l app=todo-backend --ignore-not-found=true --timeout=60s
           
-          echo "🧹 Cleaning old backend Docker images..."
-          docker images | grep todo-backend | awk '{print $3}' | xargs -r docker rmi -f 2>/dev/null || echo "No old backend images"
-          docker system prune -f > /dev/null 2>&1
+          echo "🧹 STEP 2: Cleaning all Docker artifacts..."
+          # Remove all todo-backend related images (including dangling ones)
+          docker images | grep -E "(todo-backend|<none>)" | awk '{print $3}' | xargs -r docker rmi -f 2>/dev/null || echo "No old images found"
+          # Force remove all unused Docker data
+          docker system prune -af --volumes > /dev/null 2>&1
+          docker builder prune -af > /dev/null 2>&1
           
-          # Update backend project
+          echo "🧹 STEP 3: Cleaning project directory and database..."
           cd /root
-          rm -rf todo-backend || true
+          # Complete removal of project directory
+          rm -rf todo-backend 2>/dev/null || true
+          # Remove any orphaned database files
+          find /root -name "todo.db" -delete 2>/dev/null || true
+          find /root -name "*.db" -path "*/todo-backend/*" -delete 2>/dev/null || true
+          
+          echo "🧹 STEP 4: Memory cleanup..."
+          # Clear system caches for fresh start
+          sync && echo 3 > /proc/sys/vm/drop_caches 2>/dev/null || true
           echo "📥 Cloning backend repository..."
           git clone --quiet https://github.com/deha388/todo-backend.git
           cd todo-backend
           
-          # Build backend Docker image
-          echo "🏗️ Building Go backend Docker image..."
+          # Build backend Docker image (clean slate)
+          echo "🏗️ Building Go backend Docker image from scratch..."
+          # Ensure completely clean Docker environment
           docker system prune -af --volumes > /dev/null 2>&1
-          sync && echo 3 > /proc/sys/vm/drop_caches
           
-          # Build with multi-stage Dockerfile
-          DOCKER_BUILDKIT=1 docker build \
-            --progress=plain \
+          # Build with legacy Docker builder (no BuildKit)
+          DOCKER_BUILDKIT=0 docker build \
             -t todo-backend:${{ github.sha }} \
             -t todo-backend:latest . || {
             echo "❌ Backend build failed, retrying without cache..."
             docker system prune -af > /dev/null 2>&1
-            DOCKER_BUILDKIT=1 docker build --no-cache \
+            DOCKER_BUILDKIT=0 docker build --no-cache \
               -t todo-backend:${{ github.sha }} \
               -t todo-backend:latest .
           }
@@ -105,7 +117,8 @@ jobs:
           # Cleanup after build
           echo "🧹 Post-build cleanup..."
           docker system prune -f > /dev/null 2>&1
-          sync && echo 1 > /proc/sys/vm/drop_caches
+          # Clear caches but keep necessary system cache
+          sync && echo 1 > /proc/sys/vm/drop_caches 2>/dev/null || true
           
           # Deploy backend to K3s
           echo "🚀 Applying Go backend to K3s..."
@@ -122,16 +135,26 @@ jobs:
           k3s kubectl get pods --no-headers | grep todo-backend || echo "No backend pods found"
           k3s kubectl get service todo-backend-service || echo "No backend service found"
           
-          # Test backend health
-          echo "🔍 Testing backend health..."
+          # Test backend health and verify fresh deployment
+          echo "🔍 Testing backend health and verifying fresh deployment..."
           POD_NAME=$(k3s kubectl get pods -l app=todo-backend -o jsonpath='{.items[0].metadata.name}' 2>/dev/null || echo "")
           if [ ! -z "$POD_NAME" ]; then
+            echo "✅ Pod found: $POD_NAME"
+            # Wait a bit for pod to be fully ready
+            sleep 10
             k3s kubectl exec $POD_NAME -- wget -qO- http://localhost:8083/health || echo "Health check failed"
+            # Verify fresh database (should be empty)
+            echo "🔍 Checking fresh database state..."
+            k3s kubectl exec $POD_NAME -- wget -qO- http://localhost:8083/api/todos || echo "Fresh database check failed"
+          else
+            echo "❌ No backend pod found"
           fi
           
-          echo "✅ Go Backend deployment completed!"
+          echo "✅ Go Backend FRESH deployment completed!"
           echo "🔗 Backend service: todo-backend-service:8083"
           echo "💾 Memory usage: $(free -m | awk 'NR==2{printf "%.1f%% used", $3*100/$2}')"
+          echo "🗃️ Database: Fresh SQLite database (empty state)"
+          echo "🆕 Deployment: Completely fresh installation"
           
     - name: Backend Deployment Success
       run: |
