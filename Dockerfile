@@ -1,8 +1,8 @@
 # Multi-stage build for Go backend
 FROM golang:1.21-alpine AS builder
 
-# Install git for private modules (if needed)
-RUN apk add --no-cache git ca-certificates tzdata
+# Install build dependencies for CGO (SQLite requires CGO)
+RUN apk add --no-cache git ca-certificates tzdata gcc musl-dev
 
 # Set working directory
 WORKDIR /app

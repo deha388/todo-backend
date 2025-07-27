@@ -1,0 +1,217 @@
+name: Go Backend Deploy Pipeline
+
+on:
+  push:
+    branches: [ main ]
+  workflow_dispatch: # Allow manual trigger
+
+env:
+  GO_VERSION: '1.21'
+  DOCKER_IMAGE: todo-backend
+
+jobs:
+  # Step 1: Build & Test Go Application
+  build-test:
+    runs-on: ubuntu-latest
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v4
+      
+    - name: Setup Go
+      uses: actions/setup-go@v4
+      with:
+        go-version: ${{ env.GO_VERSION }}
+        cache: true
+        
+    - name: Download dependencies
+      run: go mod download && go mod verify
+      
+    - name: Run tests
+      run: |
+        echo "🧪 Running unit tests..."
+        go test -v ./test/unit/...
+        echo "🧪 Running integration tests..."
+        go test -v ./test/integration/...
+        echo "🧪 Running contract tests..."
+        go test -v ./test/contract/...
+        
+    - name: Build application
+      run: |
+        echo "🏗️ Building Go application..."
+        CGO_ENABLED=1 GOOS=linux go build -a -installsuffix cgo -o main ./cmd/main.go
+        echo "✅ Build successful!"
+
+  # Step 2: Deploy to Production K8s
+  deploy-backend:
+    runs-on: ubuntu-latest
+    needs: build-test
+    environment: production
+    if: github.ref == 'refs/heads/main'
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v4
+      
+    - name: Deploy Go Backend to VPS
+      uses: appleboy/ssh-action@v1.0.3
+      with:
+        host: ${{ secrets.DO_HOST }}
+        username: ${{ secrets.DO_USERNAME }}
+        password: ${{ secrets.DO_PASSWORD }}
+        timeout: 20m
+        command_timeout: 15m
+        script: |
+          echo "🚀 Starting Go backend deployment..."
+          
+          # System status
+          echo "💾 Memory: $(free -h | awk '/^Mem:/{printf "%s used, %s available", $3, $7}')"
+          
+          # 🧹 CLEANUP: Remove old backend deployments
+          echo "🧹 Cleaning old backend deployments..."
+          k3s kubectl delete deployment todo-backend --ignore-not-found=true --timeout=60s
+          k3s kubectl delete service todo-backend-service --ignore-not-found=true --timeout=60s
+          
+          echo "🧹 Cleaning old backend Docker images..."
+          docker images | grep todo-backend | awk '{print $3}' | xargs -r docker rmi -f 2>/dev/null || echo "No old backend images"
+          docker system prune -f > /dev/null 2>&1
+          
+          # Update backend project
+          cd /root
+          rm -rf todo-backend || true
+          echo "📥 Cloning backend repository..."
+          git clone --quiet https://github.com/deha388/todo-backend.git
+          cd todo-backend
+          
+          # Build backend Docker image
+          echo "🏗️ Building Go backend Docker image..."
+          docker system prune -af --volumes > /dev/null 2>&1
+          sync && echo 3 > /proc/sys/vm/drop_caches
+          
+          # Build with multi-stage Dockerfile
+          DOCKER_BUILDKIT=1 docker build \
+            --progress=plain \
+            -t todo-backend:${{ github.sha }} \
+            -t todo-backend:latest . || {
+            echo "❌ Backend build failed, retrying without cache..."
+            docker system prune -af > /dev/null 2>&1
+            DOCKER_BUILDKIT=1 docker build --no-cache \
+              -t todo-backend:${{ github.sha }} \
+              -t todo-backend:latest .
+          }
+          
+          # Import backend image to K3s
+          echo "📥 Importing Go backend image to K3s..."
+          docker save todo-backend:latest | sudo k3s ctr -n k8s.io images import -
+          
+          # Cleanup after build
+          echo "🧹 Post-build cleanup..."
+          docker system prune -f > /dev/null 2>&1
+          sync && echo 1 > /proc/sys/vm/drop_caches
+          
+          # Deploy backend to K3s
+          echo "🚀 Applying Go backend to K3s..."
+          
+          # Create backend deployment manifest
+          cat > backend-deployment.yaml << 'EOF'
+          ---
+          # Go Backend Deployment
+          apiVersion: apps/v1
+          kind: Deployment
+          metadata:
+            name: todo-backend
+            labels:
+              app: todo-backend
+          spec:
+            replicas: 1
+            selector:
+              matchLabels:
+                app: todo-backend
+            template:
+              metadata:
+                labels:
+                  app: todo-backend
+              spec:
+                containers:
+                - name: backend
+                  image: todo-backend:latest
+                  imagePullPolicy: Never
+                  ports:
+                  - containerPort: 8083
+                  env:
+                  - name: PORT
+                    value: "8083"
+                  - name: GO_ENV
+                    value: "production"
+                  resources:
+                    requests:
+                      memory: "128Mi"
+                      cpu: "100m"
+                    limits:
+                      memory: "512Mi"
+                      cpu: "300m"
+                  livenessProbe:
+                    httpGet:
+                      path: /health
+                      port: 8083
+                    initialDelaySeconds: 30
+                    periodSeconds: 10
+                  readinessProbe:
+                    httpGet:
+                      path: /health
+                      port: 8083
+                    initialDelaySeconds: 5
+                    periodSeconds: 5
+          
+          ---
+          # Go Backend Service
+          apiVersion: v1
+          kind: Service
+          metadata:
+            name: todo-backend-service
+            labels:
+              app: todo-backend
+          spec:
+            type: ClusterIP
+            ports:
+            - port: 8083
+              targetPort: 8083
+              protocol: TCP
+            selector:
+              app: todo-backend
+          EOF
+          
+          # Apply the deployment
+          k3s kubectl apply -f backend-deployment.yaml
+          
+          # Wait for backend deployment
+          echo "⏳ Waiting for Go backend rollout..."
+          k3s kubectl rollout status deployment/todo-backend --timeout=300s
+          
+          # Show backend status
+          echo "📋 Go Backend deployment status:"
+          k3s kubectl get pods --no-headers | grep todo-backend || echo "No backend pods found"
+          k3s kubectl get service todo-backend-service || echo "No backend service found"
+          
+          # Test backend health
+          echo "🔍 Testing backend health..."
+          POD_NAME=$(k3s kubectl get pods -l app=todo-backend -o jsonpath='{.items[0].metadata.name}' 2>/dev/null || echo "")
+          if [ ! -z "$POD_NAME" ]; then
+            k3s kubectl exec $POD_NAME -- wget -qO- http://localhost:8083/health || echo "Health check failed"
+          fi
+          
+          echo "✅ Go Backend deployment completed!"
+          echo "🔗 Backend service: todo-backend-service:8083"
+          echo "💾 Memory usage: $(free -m | awk 'NR==2{printf "%.1f%% used", $3*100/$2}')"
+          
+    - name: Backend Deployment Success
+      run: |
+        echo "🎉 Go Backend production deployment completed!"
+        echo "📝 Summary:"
+        echo "✅ Go application tested (unit + integration + contract)"
+        echo "✅ Multi-stage Docker image built"
+        echo "✅ Deployed to Kubernetes cluster"
+        echo "✅ Health checks configured"
+        echo "🔗 Backend API available at: todo-backend-service:8083"
+        echo "📊 Endpoints:"
+        echo "  - GET  /health"
+        echo "  - GET  /api/todos"
+        echo "  - POST /api/todos" 
