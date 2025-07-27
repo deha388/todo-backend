@@ -110,77 +110,8 @@ jobs:
           # Deploy backend to K3s
           echo "🚀 Applying Go backend to K3s..."
           
-          # Create backend deployment manifest
-          cat > backend-deployment.yaml << 'EOF'
-          ---
-          # Go Backend Deployment
-          apiVersion: apps/v1
-          kind: Deployment
-          metadata:
-            name: todo-backend
-            labels:
-              app: todo-backend
-          spec:
-            replicas: 1
-            selector:
-              matchLabels:
-                app: todo-backend
-            template:
-              metadata:
-                labels:
-                  app: todo-backend
-              spec:
-                containers:
-                - name: backend
-                  image: todo-backend:latest
-                  imagePullPolicy: Never
-                  ports:
-                  - containerPort: 8083
-                  env:
-                  - name: PORT
-                    value: "8083"
-                  - name: GO_ENV
-                    value: "production"
-                  resources:
-                    requests:
-                      memory: "128Mi"
-                      cpu: "100m"
-                    limits:
-                      memory: "512Mi"
-                      cpu: "300m"
-                  livenessProbe:
-                    httpGet:
-                      path: /health
-                      port: 8083
-                    initialDelaySeconds: 30
-                    periodSeconds: 10
-                  readinessProbe:
-                    httpGet:
-                      path: /health
-                      port: 8083
-                    initialDelaySeconds: 5
-                    periodSeconds: 5
-          
-          ---
-          # Go Backend Service
-          apiVersion: v1
-          kind: Service
-          metadata:
-            name: todo-backend-service
-            labels:
-              app: todo-backend
-          spec:
-            type: ClusterIP
-            ports:
-            - port: 8083
-              targetPort: 8083
-              protocol: TCP
-            selector:
-              app: todo-backend
-          EOF
-          
-          # Apply the deployment
-          k3s kubectl apply -f backend-deployment.yaml
+          # Apply the backend deployment using the dedicated K8s YAML file
+          k3s kubectl apply -f k8s-deployment.yaml
           
           # Wait for backend deployment
           echo "⏳ Waiting for Go backend rollout..."
