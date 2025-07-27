@@ -140,8 +140,9 @@ jobs:
           POD_NAME=$(k3s kubectl get pods -l app=todo-backend -o jsonpath='{.items[0].metadata.name}' 2>/dev/null || echo "")
           if [ ! -z "$POD_NAME" ]; then
             echo "✅ Pod found: $POD_NAME"
-            # Wait a bit for pod to be fully ready
-            sleep 10
+            # Wait for Go application to fully start (SQLite setup takes time)
+            echo "⏳ Waiting for Go application to be ready..."
+            sleep 30
             k3s kubectl exec $POD_NAME -- wget -qO- http://localhost:8083/health || echo "Health check failed"
             # Verify fresh database (should be empty)
             echo "🔍 Checking fresh database state..."
