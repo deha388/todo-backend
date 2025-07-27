@@ -1,0 +1,12 @@
+# Todo App Configuration
+server:
+  host: "0.0.0.0"
+  port: 8083
+
+database:
+  type: "sqlite"
+  file: "todo.db"
+
+logging:
+  level: "info"
+  format: "json" 
